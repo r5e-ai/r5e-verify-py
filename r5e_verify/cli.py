@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 
 from .provenance import (
+    EVIDENCE_REF_RE,
     ProvenanceInputError,
     _validate_reader_options,
     verify_provenance_file,
@@ -18,6 +19,7 @@ USAGE = (
     "                                     [--trusted-publisher KEYID[=DOMAIN,...]]...\n"
     "                                     [--root KEYID | --trusted-root KEYID]... [--establish-authority]\n"
     "                                     [--chain REF | --trusted-chain REF] [--min-start-seq N]\n"
+    "                                     [--checkpoint SEQ=REF | --checkpoint SEQ:REF]...\n"
     "                                     [--definitions-dir PATH]\n"
     "                                     [--report FILE]\n"
     "                                     [--allow-incomplete]\n"
@@ -40,9 +42,26 @@ _PROVENANCE_VALUE_FLAGS = (
     "--trusted-chain",
     "--chain",
     "--min-start-seq",
+    "--checkpoint",
     "--definitions-dir",
     "--report",
 )
+
+
+def _parse_checkpoint_pin(value: str) -> dict[str, object]:
+    if "=" in value:
+        seq_str, _, ref_str = value.partition("=")
+    elif ":" in value:
+        seq_str, _, ref_str = value.partition(":")
+    else:
+        raise ProvenanceInputError(
+            f"invalid --checkpoint value {value!r} (expected SEQ=REF or SEQ:REF)"
+        )
+    if not (seq_str.isascii() and seq_str.isdigit()) or int(seq_str) < 1:
+        raise ProvenanceInputError(f"invalid --checkpoint sequence integer: {seq_str!r}")
+    if EVIDENCE_REF_RE.match(ref_str) is None:
+        raise ProvenanceInputError(f"invalid --checkpoint evidence reference: {ref_str!r}")
+    return {"seq": int(seq_str), "ref": ref_str}
 
 
 def provenance_arguments(
@@ -57,6 +76,7 @@ def provenance_arguments(
     str | None,
     bool,
     str | None,
+    list[dict[str, object]],
 ]:
     args = raw_args[1:] if raw_args and raw_args[0] == "provenance" else list(raw_args)
     positional: list[str] = []
@@ -67,6 +87,7 @@ def provenance_arguments(
     establish_authority = False
     trusted_chain: str | None = None
     min_start_seq: int | None = None
+    trusted_checkpoints: list[dict[str, object]] = []
     definitions_dir: str | None = None
     report_out: str | None = None
     allow_incomplete = False
@@ -99,6 +120,8 @@ def provenance_arguments(
             if not (value.isascii() and value.isdigit()):
                 raise ProvenanceInputError(f"invalid --min-start-seq integer: {value!r}")
             min_start_seq = int(value)
+        elif flag == "--checkpoint":
+            trusted_checkpoints.append(_parse_checkpoint_pin(value))
         elif flag == "--report":
             if report_out is not None:
                 raise ProvenanceInputError("--report may not be specified more than once")
@@ -155,6 +178,7 @@ def provenance_arguments(
         definitions_dir,
         allow_incomplete,
         report_out,
+        trusted_checkpoints,
     )
 
 
@@ -172,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
                 defs_dir,
                 allow_inc,
                 report_out,
+                checkpoints,
             ) = provenance_arguments(raw_args)
         except ProvenanceInputError:
             raise
@@ -187,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             min_start_seq=min_seq,
             definitions_dir=defs_dir,
             allow_incomplete=allow_inc,
+            trusted_checkpoints=checkpoints,
         )
         if report_out is not None:
             try:

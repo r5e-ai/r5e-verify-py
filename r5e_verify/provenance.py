@@ -91,12 +91,45 @@ SALTED_BYTES_REF_RE = re.compile(r"\Abytes:sha256\+salt:[0-9a-f]{64}\Z")
 EVENT_REF_RE = re.compile(r"\Aevent:sha256:[0-9a-f]{64}\Z")
 EVIDENCE_REF_RE = re.compile(r"\Aevidence:sha256:[0-9a-f]{64}\Z")
 SHA256_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+KEY_ID_RE = re.compile(r"\Akey:[a-z0-9-]+:sha256:[0-9a-f]{64}\Z")
 
 BASIS_KIND = "provenance.r5e.io/v2/Basis"
 BASIS_OVERLAY_KIND = "provenance.r5e.io/v2/BasisOverlay"
 RELEASE_REQUEST_KIND = "provenance.r5e.io/v2/ReleaseRequest"
 RELEASE_RECEIPT_KIND = "provenance.r5e.io/v2/ReleaseReceipt"
 ERASURE_ANSWER_KIND = "provenance.r5e.io/v2/ErasureAnswer"
+
+A11_ROOT_KINDS: frozenset[str] = frozenset(
+    {
+        BASIS_KIND,
+        BASIS_OVERLAY_KIND,
+        RELEASE_REQUEST_KIND,
+        RELEASE_RECEIPT_KIND,
+        ERASURE_ANSWER_KIND,
+    }
+)
+
+A11_EXTENDED_BODY_FIELDS: frozenset[str] = frozenset(
+    {
+        "custodyLevel",
+        "recoveryProof",
+        "hardwareAttestationRef",
+        "erasureAnswerRef",
+        "releaseRequestRef",
+        "releaseReceiptRef",
+        "recoveryRule",
+        "signerKind",
+        "keyStorage",
+        "basisRef",
+        "reviewAt",
+        "sealedServiceCopies",
+        "approverRoles",
+        "witnessKeys",
+        "overseerKey",
+        "allowedMeasurements",
+        "hardwareAttestationRoots",
+    }
+)
 
 A11_BUNDLE_FIELD_TYPES: dict[str, type] = {
     "saltedContent": dict,
@@ -1050,7 +1083,7 @@ def _match_ref_spec(value: str, spec: dict[str, Any], *, allow_cross_chain: bool
             )
         return False
     if "bytes" in spec:
-        return BYTES_REF_RE.match(value) is not None
+        return BYTES_REF_RE.match(value) is not None or SALTED_BYTES_REF_RE.match(value) is not None
     if "evidence" in spec:
         return EVIDENCE_REF_RE.match(value) is not None
     if "event" in spec:
@@ -1082,6 +1115,8 @@ def validate_body_against_schema(
     node: dict[str, Any],
     signers: list[str],
     parent_obj: dict[str, Any] | None = None,
+    *,
+    allow_salted: bool = False,
 ) -> bool:
     """Validate `value` against a pre-validated §2.8/§2.9 schema node."""
     types = _node_types(node)
@@ -1097,7 +1132,12 @@ def validate_body_against_schema(
         if "pattern" in node:
             pat = node["pattern"]
             regex = re.compile(translate_regex_anchors(pat).encode("utf-8"))
-            if regex.search(value.encode("utf-8")) is None:
+            if regex.search(value.encode("utf-8")) is None and not (
+                allow_salted
+                and "bytes" in pat
+                and ":sha256:" in pat
+                and SALTED_BYTES_REF_RE.match(value) is not None
+            ):
                 return False
             if pat == TIMESTAMP_PATTERN and parse_rfc3339_instant(value) is None:
                 return False
@@ -1133,11 +1173,20 @@ def validate_body_against_schema(
 
     if isinstance(value, list):
         if node.get("unique") is True:
-            for idx, item in enumerate(value):
-                if any(json_eq(item, prev) for prev in value[:idx]):
+            seen_canon: set[bytes] = set()
+            for item in value:
+                try:
+                    encoded = canonical_json_bytes(item)
+                except (TypeError, ValueError):
                     return False
+                if encoded in seen_canon:
+                    return False
+                seen_canon.add(encoded)
         if "items" in node and not all(
-            validate_body_against_schema(item, node["items"], signers, None) for item in value
+            validate_body_against_schema(
+                item, node["items"], signers, None, allow_salted=allow_salted
+            )
+            for item in value
         ):
             return False
 
@@ -1154,12 +1203,16 @@ def validate_body_against_schema(
         if node.get("additionalProperties") is False and not all(k in props for k in value):
             return False
         for k, subnode in props.items():
-            if k in value and not validate_body_against_schema(value[k], subnode, signers, value):
+            if k in value and not validate_body_against_schema(
+                value[k], subnode, signers, value, allow_salted=allow_salted
+            ):
                 return False
         if "values" in node:
             val_node = node["values"]
             for k, val in value.items():
-                if k not in props and not validate_body_against_schema(val, val_node, signers, None):
+                if k not in props and not validate_body_against_schema(
+                    val, val_node, signers, None, allow_salted=allow_salted
+                ):
                     return False
         if "nonEmpty" in node:
             for name in node["nonEmpty"]:
@@ -1455,20 +1508,159 @@ def _collect_record_content_refs(kind_path: str | None, body: Any) -> set[str]:
     return cited
 
 
-def _validate_bundle_shape(bundle: Any, export_schema: dict[str, Any]) -> bool:
-    """Validate export bundle wire shape, permitting additive optional A11 members."""
+def _is_utc_rfc3339(value: Any) -> bool:
+    return type(value) is str and value.endswith("Z") and parse_rfc3339_instant(value) is not None
+
+
+def _validate_a11_top_level_members(bundle: dict[str, Any]) -> bool:
+    """Validate optional A11 top-level bundle members per A11 §7.1."""
+    if "saltedContent" in bundle:
+        sc = bundle["saltedContent"]
+        if not isinstance(sc, dict):
+            return False
+        for k, v in sc.items():
+            if type(k) is not str or SALTED_BYTES_REF_RE.match(k) is None:
+                return False
+            if not isinstance(v, dict) or set(v.keys()) != {"salt", "bytes"}:
+                return False
+            if type(v["salt"]) is not str or type(v["bytes"]) is not str:
+                return False
+
+    if "witnessReceipts" in bundle:
+        wr = bundle["witnessReceipts"]
+        if not isinstance(wr, dict):
+            return False
+        expected_wr_keys = {
+            "logIndex",
+            "loggedAt",
+            "requestHash",
+            "requestRef",
+            "signature",
+            "witnessKey",
+        }
+        for k, v in wr.items():
+            if type(k) is not str or BYTES_REF_RE.match(k) is None:
+                return False
+            if not isinstance(v, dict) or set(v.keys()) != expected_wr_keys:
+                return False
+            log_idx = v["logIndex"]
+            if type(log_idx) is not int or log_idx < 0:
+                return False
+            if not _is_utc_rfc3339(v["loggedAt"]):
+                return False
+            if type(v["requestHash"]) is not str or SHA256_DIGEST_RE.match(v["requestHash"]) is None:
+                return False
+            if type(v["requestRef"]) is not str or EVIDENCE_REF_RE.match(v["requestRef"]) is None:
+                return False
+            if type(v["signature"]) is not str:
+                return False
+            if type(v["witnessKey"]) is not str or KEY_ID_RE.match(v["witnessKey"]) is None:
+                return False
+
+    if "unlockLog" in bundle:
+        ul = bundle["unlockLog"]
+        if not isinstance(ul, list):
+            return False
+        expected_ul_keys = {"entryId", "operatorKey", "releaseRef", "session", "unlockedAt"}
+        for item in ul:
+            if not isinstance(item, dict) or set(item.keys()) != expected_ul_keys:
+                return False
+            if type(item["entryId"]) is not str or len(item["entryId"]) == 0:
+                return False
+            if type(item["operatorKey"]) is not str or KEY_ID_RE.match(item["operatorKey"]) is None:
+                return False
+            rel_ref = item["releaseRef"]
+            if rel_ref is not None and (
+                type(rel_ref) is not str or EVIDENCE_REF_RE.match(rel_ref) is None
+            ):
+                return False
+            if type(item["session"]) is not str or len(item["session"]) == 0:
+                return False
+            if not _is_utc_rfc3339(item["unlockedAt"]):
+                return False
+
+    if "pinnedCheckpoints" in bundle:
+        pc = bundle["pinnedCheckpoints"]
+        if not isinstance(pc, list):
+            return False
+        for item in pc:
+            if not isinstance(item, dict) or set(item.keys()) != {"seq", "ref"}:
+                return False
+            seq = item["seq"]
+            if type(seq) is not int or seq < 1:
+                return False
+            if type(item["ref"]) is not str or EVIDENCE_REF_RE.match(item["ref"]) is None:
+                return False
+
+    return True
+
+
+def _validate_bundle_shape(
+    bundle: Any,
+    export_schema: dict[str, Any],
+    *,
+    allow_a11: bool = False,
+) -> bool:
+    """Validate export bundle wire shape; A11 members are permitted only when `allow_a11=True`."""
     if not isinstance(bundle, dict):
         return False
-    has_a11 = False
-    for key, expected_type in A11_BUNDLE_FIELD_TYPES.items():
-        if key in bundle:
-            if not isinstance(bundle[key], expected_type):
-                return False
-            has_a11 = True
+    if not allow_a11:
+        return validate_wire_schema(bundle, export_schema)
+    has_a11 = any(key in bundle for key in A11_BUNDLE_FIELD_TYPES)
     if not has_a11:
         return validate_wire_schema(bundle, export_schema)
+    if not _validate_a11_top_level_members(bundle):
+        return False
     base_bundle = {k: v for k, v in bundle.items() if k not in A11_BUNDLE_FIELD_TYPES}
     return validate_wire_schema(base_bundle, export_schema)
+
+
+def _node_has_salted_ref(node: Any) -> bool:
+    if type(node) is str:
+        return SALTED_BYTES_REF_RE.match(node) is not None
+    if isinstance(node, list):
+        return any(_node_has_salted_ref(item) for item in node)
+    if isinstance(node, dict):
+        return any(_node_has_salted_ref(val) for val in node.values())
+    return False
+
+
+def is_a11_bundle(bundle: Any) -> bool:
+    """Detect whether a parsed bundle uses Amendment A11 surfaces per A11 §5.1."""
+    if not isinstance(bundle, dict):
+        return False
+    if any(k in bundle for k in A11_BUNDLE_FIELD_TYPES):
+        return True
+    records = bundle.get("records")
+    if not isinstance(records, list):
+        return False
+    for entry in records:
+        if not isinstance(entry, dict):
+            continue
+        env = entry.get("envelope")
+        if not isinstance(env, dict):
+            continue
+        raw_payload = env.get("payload")
+        if type(raw_payload) is not str:
+            continue
+        try:
+            payload_bytes = decode_strict_base64(raw_payload)
+            payload = parse_canonical_json(payload_bytes)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        api_ver = payload.get("apiVersion")
+        kind = payload.get("kind")
+        if type(api_ver) is str and type(kind) is str and f"{api_ver}/{kind}" in A11_ROOT_KINDS:
+            return True
+        body = payload.get("body")
+        if isinstance(body, dict):
+            if any(k in A11_EXTENDED_BODY_FIELDS for k in body):
+                return True
+            if _node_has_salted_ref(body):
+                return True
+    return False
 
 
 def _signature_count_matches_definition(
@@ -1533,7 +1725,24 @@ def verify_record_envelope(
     return (payload_bytes, payload, sig_entries), _finding(1, rec_ref, "identity", "ok", "ok")
 
 
-def verify_provenance_bundle(
+def _succession_admitted_to_a5(
+    rec: OpenedRecord,
+    excluded_succession_refs: set[str] | None,
+) -> bool:
+    """Guard A5 SuccessionIndex admission against unverified or mismatched A11 Successions."""
+    if excluded_succession_refs is not None and rec.ref in excluded_succession_refs:
+        return False
+    body = rec.payload.get("body")
+    if not isinstance(body, dict):
+        return False
+    if "recoveryProof" in body:
+        # Recovery-form Succession is admitted only when explicitly cleared by A11 V7.
+        return excluded_succession_refs is not None
+    # Standard-form Succession must be signed by [predecessor, successor] in order.
+    return rec.signers == [body.get("predecessor"), body.get("successor")]
+
+
+def verify_provenance_bundle_baseline(
     bundle: Any,
     *,
     trusted_profiles: Sequence[str] = (),
@@ -1542,8 +1751,10 @@ def verify_provenance_bundle(
     trusted_chain: str | None = None,
     min_start_seq: int | None = None,
     installed_definitions: dict[str, bytes] | None = None,
+    allow_a11: bool = False,
+    excluded_succession_refs: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Verify a parsed Provenance v2 export bundle and return the §9 report object."""
+    """Verify a parsed Provenance v2 export bundle using baseline rules and return the §9 report."""
     _validate_reader_options(trusted_roots, trusted_chain, min_start_seq, trusted_publishers)
     schemas = _load_bundled_schemas()
     base_defs_by_ref, base_def_index_refs = _load_base_definitions()
@@ -1552,7 +1763,7 @@ def verify_provenance_bundle(
     publisher_domains = _parse_trusted_publishers(trusted_publishers)
 
     # §3. The bundle
-    if not _validate_bundle_shape(bundle, schemas["export.schema.json"]):
+    if not _validate_bundle_shape(bundle, schemas["export.schema.json"], allow_a11=allow_a11):
         return _build_report([_finding(1, "bundle", "shape", "failed", "malformed_bundle")])
 
     seen_record_refs: set[str] = set()
@@ -1742,7 +1953,9 @@ def verify_provenance_bundle(
                             "signature_count_differs_from_definition",
                         )
                     )
-                elif not validate_body_against_schema(body, parsed_def.schema, rec.signers):
+                elif not validate_body_against_schema(
+                    body, parsed_def.schema, rec.signers, allow_salted=allow_a11
+                ):
                     findings.append(
                         _finding(2, rec_ref, "body", "failed", "body_does_not_match_definition")
                     )
@@ -2304,6 +2517,7 @@ def verify_provenance_bundle(
             trusted_roots=trusted_roots,
             trusted_chain=trusted_chain,
             min_start_seq=min_start_seq,
+            excluded_succession_refs=excluded_succession_refs,
         )
     )
     findings.extend(start_findings)
@@ -2334,6 +2548,7 @@ def verify_provenance_bundle(
                 parsed_def_by_ref=parsed_def_by_ref,
                 seal_covered_refs=seal_covered_refs,
                 tenures_by_key=tenures_by_key,
+                excluded_succession_refs=excluded_succession_refs,
             )
             for af in a5_findings:
                 authority_ok_by_ref[af["subject"]] = af["result"] == "ok"
@@ -2902,6 +3117,7 @@ def _verify_start_stream(
     trusted_roots: Sequence[str] | None,
     trusted_chain: str | None,
     min_start_seq: int | None,
+    excluded_succession_refs: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, bool, dict[str, list[RootTenure]]]:
     """Run A6 Slice 1 & Slice 2 start checks, report start member, and root tenures."""
     candidate_streams: set[str] = set()
@@ -2938,7 +3154,8 @@ def _verify_start_stream(
                 if _is_link_shape_ok(rec):
                     auth_links_by_ref[rec.ref] = rec
             elif rec.kind_path == SUCCESSION_KIND:
-                auth_successions.append(rec)
+                if _succession_admitted_to_a5(rec, excluded_succession_refs):
+                    auth_successions.append(rec)
             elif rec.kind_path == REVOCATION_KIND:
                 rbody = rec.payload.get("body")
                 if isinstance(rbody, dict) and type(rbody.get("target")) is str:
@@ -4043,6 +4260,7 @@ def _verify_a5_authority(
     parsed_def_by_ref: dict[str, ParsedDefinition | None],
     seal_covered_refs: dict[str, set[str]],
     tenures_by_key: dict[str, list[RootTenure]],
+    excluded_succession_refs: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str]]:
     """Compute VERIFY-V2 §6.3a / A5 + A6 Slice 2 §4 + A7 §3 authority findings and qualifying seals."""
     # §1. Collect authority records (signatures all ok and body check ok)
@@ -4061,7 +4279,8 @@ def _verify_a5_authority(
                 if _is_link_shape_ok(rec):
                     auth_links_by_ref[rec.ref] = rec
             elif rec.kind_path == SUCCESSION_KIND:
-                auth_successions.append(rec)
+                if _succession_admitted_to_a5(rec, excluded_succession_refs):
+                    auth_successions.append(rec)
             elif rec.kind_path == REVOCATION_KIND:
                 target_ref = rec.payload["body"]["target"]
                 revocations_by_target.setdefault(target_ref, []).append(rec)
@@ -4947,6 +5166,56 @@ def report_exit_code(report: dict[str, Any], *, allow_incomplete: bool = False) 
     return 0
 
 
+def verify_provenance_bundle(
+    bundle: Any,
+    *,
+    trusted_profiles: Sequence[str] = (),
+    trusted_publishers: Sequence[str] = (),
+    trusted_roots: Sequence[str] | None = None,
+    trusted_chain: str | None = None,
+    min_start_seq: int | None = None,
+    installed_definitions: dict[str, bytes] | None = None,
+    trusted_checkpoints: Sequence[dict[str, Any]] = (),
+    mode: str = "auto",
+) -> dict[str, Any]:
+    """Verify a parsed Provenance v2 export bundle, automatically routing A11 bundles per A11 §5.1."""
+    if mode == "baseline":
+        return verify_provenance_bundle_baseline(
+            bundle,
+            trusted_profiles=trusted_profiles,
+            trusted_publishers=trusted_publishers,
+            trusted_roots=trusted_roots,
+            trusted_chain=trusted_chain,
+            min_start_seq=min_start_seq,
+            installed_definitions=installed_definitions,
+            allow_a11=False,
+        )
+    if mode == "a11" or bool(trusted_checkpoints) or is_a11_bundle(bundle):
+        import importlib
+
+        a11_mod = importlib.import_module("r5e_verify.a11")
+        return a11_mod.verify_provenance_bundle_a11(
+            bundle,
+            trusted_profiles=trusted_profiles,
+            trusted_publishers=trusted_publishers,
+            trusted_roots=trusted_roots,
+            trusted_chain=trusted_chain,
+            min_start_seq=min_start_seq,
+            installed_definitions=installed_definitions,
+            trusted_checkpoints=trusted_checkpoints,
+        )
+    return verify_provenance_bundle_baseline(
+        bundle,
+        trusted_profiles=trusted_profiles,
+        trusted_publishers=trusted_publishers,
+        trusted_roots=trusted_roots,
+        trusted_chain=trusted_chain,
+        min_start_seq=min_start_seq,
+        installed_definitions=installed_definitions,
+        allow_a11=False,
+    )
+
+
 def verify_provenance_file(
     bundle_path: str | Path,
     *,
@@ -4957,6 +5226,7 @@ def verify_provenance_file(
     min_start_seq: int | None = None,
     definitions_dir: str | Path | None = None,
     allow_incomplete: bool = False,
+    trusted_checkpoints: Sequence[dict[str, Any]] = (),
 ) -> tuple[bytes, int]:
     """Read a bundle file from disk, run Provenance v2 verification, return (canonical_bytes, exit_code)."""
     _validate_reader_options(trusted_roots, trusted_chain, min_start_seq, trusted_publishers)
@@ -4978,5 +5248,6 @@ def verify_provenance_file(
         trusted_chain=trusted_chain,
         min_start_seq=min_start_seq,
         installed_definitions=installed,
+        trusted_checkpoints=trusted_checkpoints,
     )
     return canonical_json_bytes(report), report_exit_code(report, allow_incomplete=allow_incomplete)
