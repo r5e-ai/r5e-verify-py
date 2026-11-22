@@ -1,0 +1,5 @@
+# Exact runtime versions tested on CPython 3.12 / Alpine 3.22 / aarch64.
+# This is an environment lock, not a claim about every Python/platform pairing.
+cryptography==50.0.1
+cffi==2.1.1
+pycparser==3.0

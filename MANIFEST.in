@@ -1,0 +1,3 @@
+include requirements-runtime.lock
+recursive-include tests *.py
+recursive-include r5e_verify/provenance_data *.json
