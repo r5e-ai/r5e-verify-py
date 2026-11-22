@@ -87,9 +87,23 @@ TIMESTAMP_PATTERN = (
 )
 
 BYTES_REF_RE = re.compile(r"\Abytes:sha256:[0-9a-f]{64}\Z")
+SALTED_BYTES_REF_RE = re.compile(r"\Abytes:sha256\+salt:[0-9a-f]{64}\Z")
 EVENT_REF_RE = re.compile(r"\Aevent:sha256:[0-9a-f]{64}\Z")
 EVIDENCE_REF_RE = re.compile(r"\Aevidence:sha256:[0-9a-f]{64}\Z")
 SHA256_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+
+BASIS_KIND = "provenance.r5e.io/v2/Basis"
+BASIS_OVERLAY_KIND = "provenance.r5e.io/v2/BasisOverlay"
+RELEASE_REQUEST_KIND = "provenance.r5e.io/v2/ReleaseRequest"
+RELEASE_RECEIPT_KIND = "provenance.r5e.io/v2/ReleaseReceipt"
+ERASURE_ANSWER_KIND = "provenance.r5e.io/v2/ErasureAnswer"
+
+A11_BUNDLE_FIELD_TYPES: dict[str, type] = {
+    "saltedContent": dict,
+    "witnessReceipts": dict,
+    "unlockLog": list,
+    "pinnedCheckpoints": list,
+}
 CANDIDATE_START_STREAM_RE = re.compile(r"\Aurn:r5e:stream:[^:]+:start\Z")
 VALID_START_STREAM_RE = re.compile(r"\Aurn:r5e:stream:[a-z0-9][a-z0-9-]*:start\Z")
 DEPLOYMENT_STREAM_RE = re.compile(r"\Aurn:r5e:stream:([a-z0-9][a-z0-9-]*):.+\Z")
@@ -1432,9 +1446,49 @@ def _collect_record_content_refs(kind_path: str | None, body: Any) -> set[str]:
         for k, val in body.items():
             if k != "targets":
                 _collect_bytes_refs(val, cited)
+    elif kind_path == RELEASE_RECEIPT_KIND and isinstance(body, dict):
+        for k, val in body.items():
+            if k not in ("releasedFingerprint", "witnessReceiptRef"):
+                _collect_bytes_refs(val, cited)
     else:
         _collect_bytes_refs(body, cited)
     return cited
+
+
+def _validate_bundle_shape(bundle: Any, export_schema: dict[str, Any]) -> bool:
+    """Validate export bundle wire shape, permitting additive optional A11 members."""
+    if not isinstance(bundle, dict):
+        return False
+    has_a11 = False
+    for key, expected_type in A11_BUNDLE_FIELD_TYPES.items():
+        if key in bundle:
+            if not isinstance(bundle[key], expected_type):
+                return False
+            has_a11 = True
+    if not has_a11:
+        return validate_wire_schema(bundle, export_schema)
+    base_bundle = {k: v for k, v in bundle.items() if k not in A11_BUNDLE_FIELD_TYPES}
+    return validate_wire_schema(base_bundle, export_schema)
+
+
+def _signature_count_matches_definition(
+    kind_path: str,
+    parsed_def: ParsedDefinition,
+    body: dict[str, Any],
+    signers: list[str],
+) -> bool:
+    """Check record signature count against definition, applying A11 §7.3 variable-signature rules."""
+    count = len(signers)
+    if parsed_def.signatures == 1:
+        if kind_path in (BASIS_KIND, BASIS_OVERLAY_KIND):
+            return count in (1, 2)
+        if kind_path == RELEASE_REQUEST_KIND:
+            return count >= 1
+        if kind_path == SUCCESSION_KIND:
+            if "recoveryProof" in body:
+                return count == 1 and signers[0] == body.get("successor")
+            return count == 2
+    return count == parsed_def.signatures
 
 
 def verify_record_envelope(
@@ -1498,7 +1552,7 @@ def verify_provenance_bundle(
     publisher_domains = _parse_trusted_publishers(trusted_publishers)
 
     # §3. The bundle
-    if not isinstance(bundle, dict) or not validate_wire_schema(bundle, schemas["export.schema.json"]):
+    if not _validate_bundle_shape(bundle, schemas["export.schema.json"]):
         return _build_report([_finding(1, "bundle", "shape", "failed", "malformed_bundle")])
 
     seen_record_refs: set[str] = set()
@@ -1676,7 +1730,9 @@ def verify_provenance_bundle(
                     findings.append(
                         _finding(2, rec_ref, "body", "failed", "definition_is_for_another_kind")
                     )
-                elif len(rec.signers) != parsed_def.signatures:
+                elif not _signature_count_matches_definition(
+                    kind_path, parsed_def, body, rec.signers
+                ):
                     findings.append(
                         _finding(
                             2,

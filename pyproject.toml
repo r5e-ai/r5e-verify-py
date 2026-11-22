@@ -27,7 +27,9 @@ r5e_verify = [
 
 [tool.basedpyright]
 include = [
+    "r5e_verify/a11.py",
     "r5e_verify/cli.py",
     "r5e_verify/provenance.py",
     "tests/test_provenance_v2.py",
+    "tests/test_provenance_v2_a11.py",
 ]
